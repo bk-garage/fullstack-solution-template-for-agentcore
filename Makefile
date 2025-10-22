@@ -9,7 +9,7 @@ NC := \033[0m  # No Color
 # Default target - run both lint and test
 all: lint test
 
-# Run tests in idp_common_pkg directory
+# Run tests
 # TODO
 
 # Run both linting and formatting in one command
