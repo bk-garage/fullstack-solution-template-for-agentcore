@@ -17,7 +17,7 @@ class GenAIIDAgentCoreStarterPackStack(cdk.Stack):
     ):
         self.props = props
         construct_id = props["stack_name_base"]
-        description = "GenAIID AgentCore Starter Pack - Main Stack"
+        description = "GenAIID AgentCore Starter Pack - Main Stack (uksb-v6dos0t5g8)"
         super().__init__(scope, construct_id, description=description, **kwargs)
 
         # Deploy backend stack first (creates Cognito + Runtime)
