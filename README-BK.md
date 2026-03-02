@@ -2,6 +2,10 @@
 
 Using Rancher Desktop for Docker.
 
+## Changes
+
+Changed the Bedrock model used in `patterns/strands-single-agent/basic_agent.py`
+
 ## Deployment
 
 https://github.com/awslabs/fullstack-solution-template-for-agentcore/blob/main/docs/DEPLOYMENT.md
