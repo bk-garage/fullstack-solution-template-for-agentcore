@@ -1,5 +1,6 @@
 import * as cdk from "aws-cdk-lib"
 import * as cognito from "aws-cdk-lib/aws-cognito"
+import * as ec2 from "aws-cdk-lib/aws-ec2"
 import * as iam from "aws-cdk-lib/aws-iam"
 import * as ssm from "aws-cdk-lib/aws-ssm"
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager"
@@ -35,9 +36,10 @@ export class BackendStack extends cdk.NestedStack {
   public runtimeArn: string
   public memoryArn: string
   private agentName: cdk.CfnParameter
-  private networkMode: cdk.CfnParameter
   private userPool: cognito.IUserPool
   private machineClient: cognito.UserPoolClient
+  private machineClientSecret: secretsmanager.Secret
+  private runtimeCredentialProvider: cdk.CustomResource
   private agentRuntime: agentcore.Runtime
 
   constructor(scope: Construct, id: string, props: BackendStackProps) {
@@ -102,13 +104,6 @@ export class BackendStack extends cdk.NestedStack {
       type: "String",
       default: "StrandsAgent",
       description: "Name for the agent runtime",
-    })
-
-    this.networkMode = new cdk.CfnParameter(this, "NetworkMode", {
-      type: "String",
-      default: "PUBLIC",
-      description: "Network mode for AgentCore resources",
-      allowedValues: ["PUBLIC", "PRIVATE"],
     })
 
     const stack = cdk.Stack.of(this)
@@ -215,11 +210,12 @@ export class BackendStack extends cdk.NestedStack {
       )
     }
 
-    // Configure network mode
-    const networkConfiguration =
-      this.networkMode.valueAsString === "PRIVATE"
-        ? undefined // For private mode, you would need to configure VPC settings
-        : agentcore.RuntimeNetworkConfiguration.usingPublicNetwork()
+    // Configure network mode based on config.yaml settings.
+    // PUBLIC: Runtime is accessible over the public internet (default).
+    // VPC: Runtime is deployed into a user-provided VPC for private network isolation.
+    //      The user must ensure their VPC has the necessary VPC endpoints for AWS services.
+    //      See docs/DEPLOYMENT.md for the full list of required VPC endpoints.
+    const networkConfiguration = this.buildNetworkConfiguration(config)
 
     // Configure JWT authorizer with Cognito
     const authorizerConfiguration = agentcore.RuntimeAuthorizerConfiguration.usingJWT(
@@ -267,7 +263,7 @@ export class BackendStack extends cdk.NestedStack {
       })
     )
 
-    // Add SSM permissions for Gateway URL lookup
+    // Add SSM permissions for AgentCore Gateway URL lookup
     agentRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "SSMParameterAccess",
@@ -293,12 +289,49 @@ export class BackendStack extends cdk.NestedStack {
       })
     )
 
+    // Add OAuth2 Credential Provider access for AgentCore Runtime
+    // The @requires_access_token decorator performs a two-stage process:
+    // 1. GetOauth2CredentialProvider - Looks up provider metadata (ARN, vendor config, grant types)
+    // 2. GetResourceOauth2Token - Uses metadata to fetch the actual access token from Token Vault
+    agentRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "OAuth2CredentialProviderAccess",
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "bedrock-agentcore:GetOauth2CredentialProvider",
+          "bedrock-agentcore:GetResourceOauth2Token",
+        ],
+        resources: [
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:oauth2-credential-provider/*`,
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/*`,
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/*`,
+        ],
+      })
+    )
+
+    // Add Secrets Manager access for OAuth2
+    // AgentCore Runtime needs to read two secrets:
+    // 1. Machine client secret (created by CDK)
+    // 2. Token Vault OAuth2 secret (created by AgentCore Identity)
+    agentRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "SecretsManagerOAuth2Access",
+        effect: iam.Effect.ALLOW,
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:/${config.stack_name_base}/machine_client_secret*`,
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:bedrock-agentcore-identity!default/oauth2/${config.stack_name_base}-runtime-gateway-auth*`,
+        ],
+      })
+    )
+
     // Environment variables for the runtime
     const envVars: { [key: string]: string } = {
       AWS_REGION: stack.region,
       AWS_DEFAULT_REGION: stack.region,
       MEMORY_ID: memoryId,
-      STACK_NAME: config.stack_name_base, // Required for agent to find SSM parameters
+      STACK_NAME: config.stack_name_base,
+      GATEWAY_CREDENTIAL_PROVIDER_NAME: `${config.stack_name_base}-runtime-gateway-auth`, // Used by @requires_access_token decorator to look up the correct provider
     }
 
     // Create the runtime using L2 construct
@@ -379,12 +412,6 @@ export class BackendStack extends cdk.NestedStack {
       description: "Machine Client ID for M2M authentication",
     })
 
-    new secretsmanager.Secret(this, "MachineClientSecret", {
-      secretName: `/${config.stack_name_base}/machine_client_secret`,
-      secretStringValue: cdk.SecretValue.unsafePlainText(this.machineClient.userPoolClientSecret.unsafeUnwrap()),
-      description: "Machine Client Secret for M2M authentication",
-    })
-
     // Use the correct Cognito domain format from the passed domain
     new ssm.StringParameter(this, "CognitoDomainParam", {
       parameterName: `/${config.stack_name_base}/cognito_provider`,
@@ -455,9 +482,11 @@ export class BackendStack extends cdk.NestedStack {
     feedbackTable: dynamodb.Table
   ): void {
     // Create Lambda function for feedback using Python
+    // ARM_64 required — matches Powertools ARM64 layer and avoids cross-platform
     const feedbackLambda = new PythonFunction(this, "FeedbackLambda", {
       functionName: `${config.stack_name_base}-feedback`,
       runtime: lambda.Runtime.PYTHON_3_13,
+      architecture: lambda.Architecture.ARM_64,
       entry: path.join(__dirname, "..", "lambdas", "feedback"),
       handler: "handler",
       environment: {
@@ -629,6 +658,100 @@ export class BackendStack extends cdk.NestedStack {
     const cognitoIssuer = `https://cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}`
     const cognitoDiscoveryUrl = `${cognitoIssuer}/.well-known/openid-configuration`
 
+    // Create OAuth2 Credential Provider for AgentCore Runtime to authenticate with AgentCore Gateway
+    // Uses cr.Provider pattern with explicit Lambda to avoid logging secrets in CloudWatch
+    const providerName = `${config.stack_name_base}-runtime-gateway-auth`
+
+    // Lambda to create/delete OAuth2 provider
+    const oauth2ProviderLambda = new lambda.Function(this, "OAuth2ProviderLambda", {
+      runtime: lambda.Runtime.PYTHON_3_13,
+      handler: "index.handler",
+      code: lambda.Code.fromAsset(path.join(__dirname, "..", "lambdas", "oauth2-provider")),
+      timeout: cdk.Duration.minutes(5),
+      logGroup: new logs.LogGroup(this, "OAuth2ProviderLambdaLogGroup", {
+        logGroupName: `/aws/lambda/${config.stack_name_base}-oauth2-provider`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    // Grant Lambda permissions to read machine client secret
+    this.machineClientSecret.grantRead(oauth2ProviderLambda)
+
+    // Grant Lambda permissions for Bedrock AgentCore operations
+    // OAuth2 Credential Provider operations - scoped to all providers in default Token Vault
+    // Note: Need both vault-level and nested resource permissions because:
+    // - CreateOauth2CredentialProvider checks permission on vault itself (token-vault/default)
+    // - Also checks permission on the nested resource path (token-vault/default/oauth2credentialprovider/*)
+    oauth2ProviderLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "bedrock-agentcore:CreateOauth2CredentialProvider",
+          "bedrock-agentcore:DeleteOauth2CredentialProvider",
+          "bedrock-agentcore:GetOauth2CredentialProvider",
+        ],
+        resources: [
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default`,
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default/oauth2credentialprovider/*`,
+        ],
+      })
+    )
+
+    // Token Vault operations - scoped to default vault
+    // Note: Need both exact match (default) and wildcard (default/*) because:
+    // - AWS checks permission on the vault container itself (token-vault/default)
+    // - AWS also checks permission on resources inside (token-vault/default/*)
+    oauth2ProviderLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "bedrock-agentcore:CreateTokenVault",
+          "bedrock-agentcore:GetTokenVault",
+          "bedrock-agentcore:DeleteTokenVault",
+        ],
+        resources: [
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default`,
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default/*`,
+        ],
+      })
+    )
+
+    // Grant Lambda permissions for Token Vault secret management
+    // Scoped to OAuth2 secrets in AgentCore Identity default namespace
+    oauth2ProviderLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "secretsmanager:CreateSecret",
+          "secretsmanager:DeleteSecret",
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:PutSecretValue",
+        ],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:bedrock-agentcore-identity!default/oauth2/*`,
+        ],
+      })
+    )
+
+    // Create Custom Resource Provider
+    const oauth2Provider = new cr.Provider(this, "OAuth2ProviderProvider", {
+      onEventHandler: oauth2ProviderLambda,
+    })
+
+    // Create Custom Resource
+    const runtimeCredentialProvider = new cdk.CustomResource(this, "RuntimeCredentialProvider", {
+      serviceToken: oauth2Provider.serviceToken,
+      properties: {
+        ProviderName: providerName,
+        ClientSecretArn: this.machineClientSecret.secretArn,
+        DiscoveryUrl: cognitoDiscoveryUrl,
+        ClientId: this.machineClient.userPoolClientId,
+      },
+    })
+
+
+
+    // Store for use in createAgentCoreRuntime()
+    this.runtimeCredentialProvider = runtimeCredentialProvider
+
     // Create Gateway using L1 construct (CfnGateway)
     // This replaces the Custom Resource approach with native CloudFormation support
     const gateway = new bedrockagentcore.CfnGateway(this, "AgentCoreGateway", {
@@ -680,7 +803,7 @@ export class BackendStack extends cdk.NestedStack {
     gateway.node.addDependency(this.machineClient)
     gateway.node.addDependency(gatewayRole)
 
-    // Store Gateway URL in SSM for runtime access
+    // Store AgentCore Gateway URL in SSM for AgentCore Runtime access
     new ssm.StringParameter(this, "GatewayUrlParam", {
       parameterName: `/${config.stack_name_base}/gateway_url`,
       stringValue: gateway.attrGatewayUrl,
@@ -782,6 +905,73 @@ export class BackendStack extends cdk.NestedStack {
 
     // Machine client must be created after resource server
     this.machineClient.node.addDependency(resourceServer)
+
+    // Store machine client secret in Secrets Manager for testing and external access.
+    // This secret is used by test scripts and potentially other external tools.
+    this.machineClientSecret = new secretsmanager.Secret(this, "MachineClientSecret", {
+      secretName: `/${config.stack_name_base}/machine_client_secret`,
+      secretStringValue: cdk.SecretValue.unsafePlainText(
+        this.machineClient.userPoolClientSecret.unsafeUnwrap()
+      ),
+      description: "Machine Client Secret for M2M authentication",
+    })
+
+
+  }
+
+  /**
+   * Builds the RuntimeNetworkConfiguration based on the config.yaml settings.
+   * When network_mode is "VPC", imports the user's existing VPC, subnets, and
+   * optionally security groups, then returns a VPC-based network configuration.
+   * When network_mode is "PUBLIC" (default), returns a public network configuration.
+   *
+   * @param config - The application configuration from config.yaml.
+   * @returns A RuntimeNetworkConfiguration for the AgentCore Runtime.
+   */
+  private buildNetworkConfiguration(config: AppConfig): agentcore.RuntimeNetworkConfiguration {
+    if (config.backend.network_mode === "VPC") {
+      const vpcConfig = config.backend.vpc
+      // vpc config is validated in ConfigManager, but guard here for type safety
+      if (!vpcConfig) {
+        throw new Error("backend.vpc configuration is required when network_mode is 'VPC'.")
+      }
+
+      // Import the user's existing VPC by ID.
+      // This performs a context lookup at synth time to resolve VPC attributes.
+      const vpc = ec2.Vpc.fromLookup(this, "ImportedVpc", {
+        vpcId: vpcConfig.vpc_id,
+      })
+
+      // Import the user-specified subnets by their IDs.
+      // These subnets must exist within the VPC specified above.
+      const subnets: ec2.ISubnet[] = vpcConfig.subnet_ids.map(
+        (subnetId: string, index: number) =>
+          ec2.Subnet.fromSubnetId(this, `ImportedSubnet${index}`, subnetId)
+      )
+
+      // Build the VPC config props for the AgentCore L2 construct.
+      // Security groups are optional — if not provided, the construct creates a default one.
+      const securityGroups =
+        vpcConfig.security_group_ids && vpcConfig.security_group_ids.length > 0
+          ? vpcConfig.security_group_ids.map(
+              (sgId: string, index: number) =>
+                ec2.SecurityGroup.fromSecurityGroupId(this, `ImportedSG${index}`, sgId)
+            )
+          : undefined
+
+      const vpcConfigProps: agentcore.VpcConfigProps = {
+        vpc: vpc,
+        vpcSubnets: {
+          subnets: subnets,
+        },
+        securityGroups: securityGroups,
+      }
+
+      return agentcore.RuntimeNetworkConfiguration.usingVpc(this, vpcConfigProps)
+    }
+
+    // Default: public network mode
+    return agentcore.RuntimeNetworkConfiguration.usingPublicNetwork()
   }
 
   /**
